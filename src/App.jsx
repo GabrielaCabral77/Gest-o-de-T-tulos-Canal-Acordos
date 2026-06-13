@@ -43,17 +43,80 @@ const STATUS = {
 };
 const STATUS_LIST = Object.entries(STATUS);
 
-// ── Storage helpers (localStorage para Vercel) ──────────────────────────────
-const localStorageGet = async (key) => {
-  try { const v = localStorage.getItem(key); return v ? { value: v } : null; } catch(e) { return null; }
+// ── Supabase config ──────────────────────────────────────────────────────────
+const SB_URL = "https://kccymhprurjfigfogmxa.supabase.co";
+const SB_KEY = "sb_publishable_guziyfTWj-DxrjIFguSsvg_CUgZ8MBr";
+
+const sbFetch = async (path, method="GET", body=null) => {
+  const opts = {
+    method,
+    headers: {
+      "apikey": SB_KEY,
+      "Authorization": `Bearer ${SB_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": method==="POST" ? "resolution=merge-duplicates,return=minimal" : "return=minimal",
+    },
+  };
+  if(body) opts.body = JSON.stringify(body);
+  const res = await fetch(`${SB_URL}/rest/v1${path}`, opts);
+  if(!res.ok) { const t=await res.text(); console.error("Supabase error:", t); return null; }
+  if(method==="GET") return res.json();
+  return true;
 };
-const localStorageSet = async (key, value) => {
-  try { localStorage.setItem(key, value); } catch(e) {}
+
+// ── Supabase helpers por tabela ───────────────────────────────────────────────
+
+// NF Status
+const sbGetAllNfStatus = async () => {
+  const rows = await sbFetch("/nf_status?select=exec_nome,grupo,nf,status");
+  if(!rows) return {};
+  const map = {};
+  rows.forEach(r => { map[`${r.exec_nome}|${r.grupo}|${r.nf}`] = r.status; });
+  return map;
+};
+const sbSetNfStatus = async (exec, grupo, nf, status) => {
+  if(status) {
+    return sbFetch("/nf_status", "POST", { exec_nome:exec, grupo, nf, status, updated_at: new Date().toISOString() });
+  } else {
+    return sbFetch(`/nf_status?exec_nome=eq.${encodeURIComponent(exec)}&grupo=eq.${encodeURIComponent(grupo)}&nf=eq.${encodeURIComponent(nf)}`, "DELETE");
+  }
+};
+
+// Emails
+const sbGetAllEmails = async () => {
+  const rows = await sbFetch("/emails_clientes?select=chave,valor");
+  if(!rows) return {};
+  const map = {};
+  rows.forEach(r => { map[r.chave] = r.valor; });
+  return map;
+};
+const sbSetEmail = async (chave, valor) => {
+  return sbFetch("/emails_clientes", "POST", { chave, valor, updated_at: new Date().toISOString() });
+};
+
+// Histórico
+const sbAddHistorico = async (exec, grupo, acao) => {
+  return sbFetch("/historico", "POST", { exec_nome:exec, grupo, acao, created_at: new Date().toISOString() });
+};
+const sbGetHistorico = async (exec) => {
+  const rows = await sbFetch(`/historico?exec_nome=eq.${encodeURIComponent(exec)}&order=created_at.desc&limit=100`);
+  return rows || [];
 };
 
 const MSGS = {
   preventivo: c=>`Prezado(a) ${c.r},\n\nEntramos em contato para informar que identificamos títulos a vencer em breve em sua conta.\n\n`+(c.prox.length?`📋 Próximos vencimentos:\n${c.prox.map(p=>`  • NF ${p.nf}  |  Venc. ${p.dt}  |  ${R(p.vlr)}`).join("\n")}\n\n`:``)+`Solicitamos confirmação de recebimento das notas.\n\nAtenciosamente,\nEquipe Financeira`,
-  vencido:    c=>`Prezado(a) ${c.r},\n\n⚠️ Títulos VENCIDOS em sua conta:\n\n`+c.venc.map(v=>`  • NF ${v.nf}  |  ${v.dt}  |  ${R(v.vlr)}  |  ${v.d} dias em atraso`).join("\n")+`\n\nSolicitamos regularização urgente.\n\nAtenciosamente,\nEquipe Financeira`,
+  vencido: c=>{
+    const faixas=[];
+    if(c.v30>0) faixas.push(`  📌 Até 30 dias:       ${R(c.v30)}`);
+    if(c.v60>0) faixas.push(`  📌 31 a 60 dias:    ${R(c.v60)}`);
+    if(c.v90>0) faixas.push(`  📌 61 a 90 dias:    ${R(c.v90)}`);
+    if(c.v91>0) faixas.push(`  🔴 Acima de 91d:   ${R(c.v91)}`);
+    const totalV=c.v30+c.v60+c.v90+c.v91;
+    const antiga=c.venc.length>0?`\\n  NF mais antiga: ${c.venc[0].nf} · ${c.venc[0].dt} · ${c.venc[0].d} dias em atraso`:"";
+    return `Prezado(a) ${c.r},\\n\\nIdentificamos títulos VENCIDOS em sua conta. Segue o resumo por faixa:\\n\\n`
+      +faixas.join("\\n")
+      +`\\n\\n📋 Total vencido: ${R(totalV)}${antiga}\\n\\nSolicitamos regularização urgente ou confirmação de pagamento para cada faixa.\\n\\nAtenciosamente,\\nEquipe Financeira`;
+  }
   lancamento: c=>`Prezado(a) ${c.r},\n\nLembrete: as notas abaixo precisam ser lançadas em seu sistema:\n\n`+(c.prox.length?c.prox.map(p=>`  📄 NF ${p.nf}  |  Venc. ${p.dt}  |  ${R(p.vlr)}`).join("\n"):"verificar pendências")+`\n\nO não lançamento pode causar atraso no pagamento.\n\nAtenciosamente,\nEquipe Financeira`,
   conciliacao:c=>`Prezado(a) ${c.r},\n\nIdentificamos crédito pendente de conciliação: ${R(c.emit?.total||0)}\n\n`+(c.emit?.itens||[]).map(i=>`  • Ref. ${i.ref}  |  ${R(i.vlr)}  |  ${i.tipo}\n    ${i.obs}`).join("\n")+`\n\nConciliar antes de efetuar qualquer pagamento.\n\nAtenciosamente,\nEquipe Financeira`,
 
@@ -106,33 +169,43 @@ export default function App() {
   const emailKey = (exec, grupo) => `${exec}|${grupo}`;
   const getEmail = (exec, c) => emailMap[emailKey(exec, c.g)] ?? c.e;
 
-  // Load Para: and De: from storage on mount
+  // Load Para: and De: from Supabase on mount
   useState(() => {
     (async () => {
       try {
-        const r1 = localStorageGet("emails_canal_para");
-        if (r1?.value) setEmailMap(JSON.parse(r1.value));
-        const r2 = localStorageGet("emails_canal_de");
-        if (r2?.value) setFromMap(JSON.parse(r2.value));
-      } catch(e) {}
+        const allEmails = await sbGetAllEmails();
+        const paraMap = {}, deMap = {};
+        Object.entries(allEmails).forEach(([k,v]) => {
+          if(k.startsWith("de|")) deMap[k.slice(3)] = v;
+          else paraMap[k] = v;
+        });
+        setEmailMap(paraMap);
+        setFromMap(deMap);
+      } catch(e) { console.error("load emails:",e); }
     })();
   });
 
   const getFrom  = (exec, c) => fromMap[emailKey(exec, c.g)] ?? "";
 
   const saveEmailPara = async (exec, grupo) => {
-    const newMap = {...emailMap, [emailKey(exec, grupo)]: emailDraft.trim()};
-    setEmailMap(newMap);
-    try { localStorageSet("emails_canal_para", JSON.stringify(newMap)); } catch(e) {}
-    setLog(prev => [{id:Date.now(), exec, g:grupo, acao:`E-mail Para: → ${emailDraft.trim()||"(removido)"}`, ts:new Date().toLocaleString("pt-BR")}, ...prev.slice(0,99)]);
+    const key = emailKey(exec, grupo);
+    const val = emailDraft.trim();
+    setEmailMap(prev => ({...prev, [key]: val}));
+    try { await sbSetEmail(key, val); } catch(e) { console.error("saveEmailPara:",e); }
+    const logEntry = `E-mail Para: → ${val||"(removido)"}`;
+    setLog(prev => [{id:Date.now(), exec, g:grupo, acao:logEntry, ts:new Date().toLocaleString("pt-BR")}, ...prev.slice(0,99)]);
+    try{ await sbAddHistorico(exec, grupo, logEntry); }catch(e){}
     setEditingEmail(null);
   };
 
   const saveEmailDe = async (exec, grupo) => {
-    const newMap = {...fromMap, [emailKey(exec, grupo)]: emailDraft.trim()};
-    setFromMap(newMap);
-    try { localStorageSet("emails_canal_de", JSON.stringify(newMap)); } catch(e) {}
-    setLog(prev => [{id:Date.now(), exec, g:grupo, acao:`E-mail De: → ${emailDraft.trim()||"(removido)"}`, ts:new Date().toLocaleString("pt-BR")}, ...prev.slice(0,99)]);
+    const key = "de|" + emailKey(exec, grupo);
+    const val = emailDraft.trim();
+    setFromMap(prev => ({...prev, [emailKey(exec,grupo)]: val}));
+    try { await sbSetEmail(key, val); } catch(e) { console.error("saveEmailDe:",e); }
+    const logEntry = `E-mail De: → ${val||"(removido)"}`;
+    setLog(prev => [{id:Date.now(), exec, g:grupo, acao:logEntry, ts:new Date().toLocaleString("pt-BR")}, ...prev.slice(0,99)]);
+    try{ await sbAddHistorico(exec, grupo, logEntry); }catch(e){}
     setEditingEmail(null);
   };
 
@@ -142,10 +215,10 @@ export default function App() {
     else await saveEmailPara(exec, grupo);
   };
 
-  // Load NF statuses from storage on mount
+  // Load NF statuses from Supabase on mount
   useState(()=>{
     (async()=>{
-      try{ const r=localStorageGet("nf_status_canal"); if(r?.value) setNfStatus(JSON.parse(r.value)); }catch(e){}
+      try{ const map=await sbGetAllNfStatus(); setNfStatus(map); }catch(e){ console.error("load nfStatus:",e); }
     })();
   });
 
@@ -155,9 +228,11 @@ export default function App() {
     const key = nfKey(exec, grupo, nf);
     const newMap = val ? {...nfStatus, [key]: val} : Object.fromEntries(Object.entries(nfStatus).filter(([k])=>k!==key));
     setNfStatus(newMap);
-    try{ localStorageSet("nf_status_canal", JSON.stringify(newMap)); }catch(e){}
+    try{ await sbSetNfStatus(exec, grupo, nf, val); }catch(e){ console.error("setNfStatus:",e); }
     const st = val ? STATUS[val] : null;
-    setLog(prev=>[{id:Date.now(), exec, g:grupo, acao:`NF ${nf}: ${st ? st.e+" "+st.l : "status removido"}`, ts:new Date().toLocaleString("pt-BR")}, ...prev.slice(0,99)]);
+    const logEntry = `NF ${nf}: ${st ? st.e+" "+st.l : "status removido"}`;
+    setLog(prev=>[{id:Date.now(), exec, g:grupo, acao:logEntry, ts:new Date().toLocaleString("pt-BR")}, ...prev.slice(0,99)]);
+    try{ await sbAddHistorico(exec, grupo, logEntry); }catch(e){}
   };
 
   // Enrich all clients
@@ -242,7 +317,9 @@ export default function App() {
 
   const copyMsg = c => {
     navigator.clipboard.writeText(MSGS[msgT](c)).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),2200);});
-    setLog(p=>[{id:Date.now(),exec:execSel,g:c.g,acao:msgT,ts:new Date().toLocaleString("pt-BR")},...p.slice(0,99)]);
+    const logEntry = `Mensagem "${msgT}" copiada`;
+    setLog(p=>[{id:Date.now(),exec:execSel,g:c.g,acao:logEntry,ts:new Date().toLocaleString("pt-BR")},...p.slice(0,99)]);
+    sbAddHistorico(execSel, c.g, logEntry).catch(()=>{});
   };
 
   const ini = name => CORES[name]?.ini || name.slice(0,2).toUpperCase();
@@ -1069,26 +1146,45 @@ export default function App() {
       })()}
 
       {/* HISTÓRICO */}
-      {subTab==="historico"&&(
-        <div style={{background:"#fff",borderRadius:12,padding:20,boxShadow:"0 1px 6px rgba(0,0,0,.08)"}}>
-          <div style={{fontWeight:700,fontSize:14,marginBottom:14}}>Histórico de Ações</div>
-          {log.filter(l=>l.exec===execSel).length===0
-            ?<div style={{color:"#90A4AE",textAlign:"center",padding:50}}><div style={{fontSize:36,marginBottom:10}}>📋</div>Nenhuma ação registrada.</div>
-            :log.filter(l=>l.exec===execSel).map(a=>(
-              <div key={a.id} style={{display:"flex",gap:12,padding:"10px 0",borderBottom:"1px solid #ECEFF1",alignItems:"center"}}>
-                <span style={{fontSize:18}}>📌</span>
-                <div style={{flex:1}}>
-                  <div style={{fontWeight:600,fontSize:13}}>{a.g}</div>
-                  <div style={{fontSize:11,color:"#607D8B"}}>{a.acao}</div>
+      {subTab==="historico"&&(()=>{
+        const [sbLog, setSbLog] = [null, null]; // placeholder — loaded via useEffect pattern below
+        const execLog = log.filter(l=>l.exec===execSel);
+        return(
+          <div style={{background:"#fff",borderRadius:12,padding:20,boxShadow:"0 1px 6px rgba(0,0,0,.08)"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+              <div style={{fontWeight:700,fontSize:14}}>Histórico de Ações</div>
+              <button onClick={async()=>{
+                try{
+                  const rows=await sbGetHistorico(execSel);
+                  const mapped=rows.map(r=>({id:r.id,exec:r.exec_nome,g:r.grupo,acao:r.acao,ts:new Date(r.created_at).toLocaleString("pt-BR")}));
+                  setLog(prev=>{
+                    const merged=[...mapped,...prev.filter(p=>!mapped.find(m=>m.id===p.id))].slice(0,200);
+                    return merged;
+                  });
+                }catch(e){console.error(e);}
+              }} style={{fontSize:11,padding:"4px 12px",borderRadius:7,border:"1px solid #CFD8DC",background:"#F5F5F5",cursor:"pointer",color:"#607D8B",fontWeight:600}}>
+                🔄 Carregar do servidor
+              </button>
+            </div>
+            {execLog.length===0
+              ?<div style={{color:"#90A4AE",textAlign:"center",padding:50}}><div style={{fontSize:36,marginBottom:10}}>📋</div>Nenhuma ação registrada.<div style={{fontSize:12,marginTop:8}}>Clique em "Carregar do servidor" para buscar o histórico completo.</div></div>
+              :execLog.map(a=>(
+                <div key={a.id} style={{display:"flex",gap:12,padding:"10px 0",borderBottom:"1px solid #ECEFF1",alignItems:"center"}}>
+                  <span style={{fontSize:18}}>📌</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontWeight:600,fontSize:13}}>{a.g}</div>
+                    <div style={{fontSize:11,color:"#607D8B"}}>{a.acao}</div>
+                  </div>
+                  <div style={{fontSize:11,color:"#90A4AE"}}>{a.ts}</div>
                 </div>
-                <div style={{fontSize:11,color:"#90A4AE"}}>{a.ts}</div>
-              </div>
-            ))
-          }
-        </div>
-      )}
+              ))
+            }
+          </div>
+        );
+      })()}
 
       </div>
     </div>
   );
 }
+
